@@ -47,12 +47,14 @@ BOT_DB_FILE = os.path.join(DATABASE_DIR, "bot_data.db")
 sys.path.append(SETTINGS_DIR)
 sys.path.append(DATABASE_DIR)
 
+import settings_manager
+import importlib
+import delay
+import dest # Import the module itself to allow reloading
+
 from database import pickledb
 
-from delay import (delay_after_join, delay_after_invite, delay_after_error,
-                   delay_between_accounts, delay_between_clients)
-
-from dest import dest
+# from dest import dest # Replaced by `import dest`
 from config import MAX_ACCOUNTS_PER_API, BOT_TOKEN, ADMIN_ID, LOG_CHANNEL_ID
 
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -120,8 +122,8 @@ async def create_telegram_account(session_name, api_id, api_hash, proxy=None):
         await account.connect()
 
         if not await account.is_user_authorized():
-            colored_print(f"  🔴 Сессия {session_name} не авторизована. Пожалуйста, авторизуйте сессию и перезапустите скрипт. Пропускаем...", RED)
-            await send_log_to_telegram(f"🔴 Сессия <b>{session_name}</b> не авторизована. Пожалуйста, авторизуйте сессию и перезапустите скрипт.")
+            colored_print(f"  ⛔ Сессия {session_name} не авторизована 😔. Пропускаем...", RED)
+            await send_log_to_telegram(f"❌ Сессия <b>{session_name}</b> не авторизована 😔.")
             return None
 
         try:
@@ -129,17 +131,17 @@ async def create_telegram_account(session_name, api_id, api_hash, proxy=None):
             if not me.first_name:
                 raise ValueError("У аккаунта отсутствует имя.")
         except ValueError as e:
-            colored_print(f"  🔴 Ошибка в сессии {session_name}: {e}. Пропускаем...", RED)
-            await send_log_to_telegram(f"🔴 Ошибка в сессии <b>{session_name}</b>: отсутствует имя. Пожалуйста, проверьте аккаунт.")
+            colored_print(f"  ⛔ Ошибка: {e}. Пропускаем сессию {session_name}", RED)
+            await send_log_to_telegram(f"❌ Ошибка в сессии <b>{session_name}</b>: отсутствует имя 😢.")
             return None
         except Exception as e:
-            colored_print(f"  🔴 Не удалось получить данные аккаунта {session_name}: {e}. Пропускаем...", RED)
-            await send_log_to_telegram(f"🔴 Ошибка в сессии <b>{session_name}</b>: не удалось получить данные аккаунта. Проверьте валидность сессии.")
+            colored_print(f"  ⛔ Не удалось получить данные аккаунта {session_name}: {e}. Пропускаем.", RED)
+            await send_log_to_telegram(f"❌ Ошибка в сессии <b>{session_name}</b>: не удалось получить данные аккаунта.")
             return None
 
     except Exception as e:
-        colored_print(f"  🔴 Не удалось создать аккаунт {session_name}: {e}. Пропускаем...", RED)
-        await send_log_to_telegram(f"🔴 Ошибка при создании аккаунта <b>{session_name}</b>: {e}")
+        colored_print(f"  ⛔ Не удалось создать аккаунт {session_name}: {e}. Пропускаем...", RED)
+        await send_log_to_telegram(f"❌ Ошибка при создании аккаунта <b>{session_name}</b>: {e}")
         return None
 
     return account
@@ -149,12 +151,8 @@ async def send_log_to_telegram(message):
     try:
         await bot.send_message(LOG_CHANNEL_ID, message)
     except Exception as e:
-        colored_print(f"  🔴 CRITICAL: Ошибка при отправке сообщения в лог-канал: {e} 💔", RED)
-        # Попытка отправить урезанное сообщение, если полное не проходит
-        try:
-            await bot.send_message(LOG_CHANNEL_ID, f"🔴 CRITICAL: Ошибка отправки лога. Детали: {str(e)[:1000]}")
-        except Exception as final_e:
-            colored_print(f"  🔴 CRITICAL: Не удалось отправить даже урезанное сообщение в лог-канал: {final_e} 💔💔", RED)
+        colored_print(f"  ERROR Ошибка при отправке сообщения в лог-канал: {e} 😢", RED)
+        await bot.send_message(LOG_CHANNEL_ID, message)
 
 
 @dp.message_handler(commands=['start'])
@@ -168,31 +166,542 @@ async def start_bot(message: types.Message):
             "✅ Использовать несколько аккаунтов Telegram для обхода ограничений.\n"
             "✅ Работать с прокси для повышения анонимности и стабильности.\n"
             "✅ Вести подробные логи происходящего как в консоли, так и в специальном Telegram-канале.\n"
-            "✅ Управляться командами через этот чат (например, /pause, /resume, /status).\n\n"
+            "✅ Управляться командами через этот чат (например, /pause, /resume, /status, /settings, /view_delays, /set_delay).\n\n"
             "🚀 Для начала работы, убедитесь, что все конфигурационные файлы (api_keys.txt, usernames.txt, dest.py, и т.д.) настроены правильно.\n\n"
             "🛠️ Если возникнут проблемы, я сообщу об этом в логах с соответствующими эмодзи и инструкциями.\n\n"
             "📡 Ожидаю ваших команд!"
-        )
+        ) # Updated start message to include new commands
         await message.reply(start_message)
+
+# Helper functions for /settings command (get_proxies_summary removed as it's replaced)
+
+@dp.message_handler(commands=['settings', 'config'])
+async def show_settings(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    # Use the new get_api_keys_list from settings_manager for API keys info
+    api_keys_list = settings_manager.get_api_keys_list(mask_hashes=True)
+    api_keys_summary_message = f"Configured Keys: <code>{len(api_keys_list)}</code>"
+    if api_keys_list:
+        if len(api_keys_list) <= 10: # Show details if list is short
+             api_keys_summary_message += "\n" + "\n".join([f"- <code>{key}</code>" for key in api_keys_list])
+        else:
+            api_keys_summary_message += " (List too long to display here, use /list_apikeys)"
+
+    # Use new settings_manager.get_usernames() for usernames info
+    current_usernames = settings_manager.get_usernames()
+    usernames_count = len(current_usernames)
+    usernames_status_message = f"Found: <code>{usernames_count}</code> users."
+    if usernames_count > 0 and usernames_count <= 10: # Show a few examples if the list is short
+        usernames_status_message += "\nExamples:\n" + "\n".join([f"- <code>{u}</code>" for u in current_usernames[:3]]) # Show first 3
+        if usernames_count > 3:
+            usernames_status_message += "\n- ..."
+    elif usernames_count == 0:
+        usernames_status_message = "File found (empty) or not found."
+
+    # Use new settings_manager.get_proxies() for proxy info
+    current_proxies = settings_manager.get_proxies()
+    proxies_count = len(current_proxies)
+    proxies_status_message = f"Found: <code>{proxies_count}</code> proxies."
+    if proxies_count > 0 and proxies_count <= 5: # Show a few examples if the list is short, masked
+        proxies_status_message += "\nExamples (masked):\n" + "\n".join([f"- <code>{settings_manager.mask_proxy_string(p)}</code>" for p in current_proxies[:3]]) # Show first 3 masked
+        if proxies_count > 3:
+            proxies_status_message += "\n- ..."
+    elif proxies_count == 0:
+        proxies_status_message = "File found (empty) or not found / Not used."
+
+    # Update /start command help text if it's not already reflecting all new commands
+    start_command_help_update_needed = False # Placeholder, assume it's updated or handle separately
+
+    settings_message = (
+        "⚙️ **Current Bot Settings** ⚙️\n\n"
+        f"**📜 Destination (`settings/dest.py`):**\n"
+        f"- Target: <code>{dest.dest if hasattr(dest, 'dest') else 'Not Set'}</code>\n\n"
+        f"**⏱️ Delays (`settings/delay.py` - seconds):**\n"
+        f"- After Join: <code>{delay.delay_after_join}</code>\n"
+        f"- After Invite: <code>{delay.delay_after_invite}</code>\n"
+        f"- After Error: <code>{delay.delay_after_error}</code>\n"
+        f"- Between Accounts: <code>{delay.delay_between_accounts}</code>\n"
+        f"- Between Clients: <code>{delay.delay_between_clients}</code>\n\n"
+        f"**🔑 API Keys (`{settings_manager.API_KEYS_FILE}`):**\n{api_keys_summary_message}\n\n"
+        f"**👤 Usernames (`{settings_manager.USERNAMES_FILE}`):**\n{usernames_status_message}\n\n"
+        f"**🌐 Proxies (`{settings_manager.PROXY_FILE_SM}`):**\n{proxies_status_message}\n\n"
+        f"**🤖 Other Config (`settings/config.py`):**\n"
+        f"- Max Accounts per API: <code>{MAX_ACCOUNTS_PER_API}</code>\n"
+        f"- Admin ID: <code>{ADMIN_ID}</code>\n"
+        f"- Log Channel ID: <code>{LOG_CHANNEL_ID}</code>"
+    )
+    await message.reply(settings_message, parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['view_delays'])
+async def view_delays_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    current_delays = settings_manager.get_all_delay_settings()
+    if not current_delays:
+        # Fallback if file reading failed but module is loaded
+        current_delays = {k: v for k, v in vars(delay).items() if k.startswith("delay_")}
+        if not current_delays:
+            return await message.reply("🔴 Could not read delay settings. Ensure `settings/delay.py` exists and is readable.")
+
+    delay_message_parts = ["⏱️ **Current Delay Settings (from `settings/delay.py`)** ⏱️\n"]
+    for key, value in current_delays.items():
+        readable_key = key.replace('_', ' ').replace('delay ', '').capitalize()
+        delay_message_parts.append(f"- {readable_key}: <code>{value}</code> seconds")
+
+    await message.reply("\n".join(delay_message_parts), parse_mode=types.ParseMode.HTML)
+
+
+@dp.message_handler(commands=['set_delay'])
+async def set_delay_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().split()
+    if len(args) != 2:
+        return await message.reply("ℹ️ Usage: `/set_delay <delay_name> <value>`\n"
+                                   "Example: `/set_delay join 7`\n"
+                                   "Valid names: `join`, `invite`, `error`, `accounts`, `clients`")
+
+    delay_short_name = args[0].lower()
+    try:
+        new_value = int(args[1])
+        if new_value < 0:
+            raise ValueError("Delay value must be a non-negative integer.")
+    except ValueError:
+        return await message.reply("🔴 Invalid value. Delay must be a non-negative integer.")
+
+    delay_key_map = {
+        "join": "delay_after_join",
+        "invite": "delay_after_invite",
+        "error": "delay_after_error",
+        "accounts": "delay_between_accounts",
+        "clients": "delay_between_clients"
+    }
+
+    if delay_short_name not in delay_key_map:
+        valid_names = ", ".join([f"<code>{name}</code>" for name in delay_key_map.keys()])
+        return await message.reply(f"🔴 Invalid delay name '<code>{delay_short_name}</code>'.\n"
+                                   f"Valid names are: {valid_names}", parse_mode=types.ParseMode.HTML)
+
+    full_delay_key = delay_key_map[delay_short_name]
+    success = settings_manager.update_delay_setting(full_delay_key, new_value)
+
+    if success:
+        try:
+            importlib.reload(delay)
+            await message.reply(f"✅ Delay '<code>{delay_short_name}</code>' (<code>{full_delay_key}</code>) updated to <code>{new_value}</code> in <code>settings/delay.py</code>.\n"
+                                "The <code>delay</code> module has been reloaded.\n"
+                                "🔁 For changes to reliably affect an active inviting session, please restart the script.",
+                                parse_mode=types.ParseMode.HTML)
+        except Exception as e:
+            await message.reply(f"🔴 Delay setting saved to file, but an error occurred while reloading the module: {e}")
+    else:
+        await message.reply(f"🔴 Failed to update '<code>{full_delay_key}</code>'. Key might be missing in <code>settings/delay.py</code> or file is not writable.")
+
+@dp.message_handler(commands=['view_dest'])
+async def view_dest_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    current_dest = settings_manager.get_dest_setting()
+    if not current_dest and hasattr(dest, 'dest'): # Fallback to loaded module if file read fails
+        current_dest = dest.dest
+
+    if current_dest:
+        await message.reply(f"📜 **Current Destination Target:**\n<code>{current_dest}</code>", parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply("🔴 Destination not set or could not be read from `settings/dest.py`.")
+
+@dp.message_handler(commands=['set_dest'])
+async def set_dest_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().split()
+    if not args:
+        return await message.reply("ℹ️ Usage: `/set_dest <target_username_or_id>`\n"
+                                   "Example: `/set_dest @mygroup` or `/set_dest -100123456789`")
+
+    new_target_dest = args[0]
+
+    if not new_target_dest: # Should be caught by split() check but good for safety
+         return await message.reply("🔴 Target destination cannot be empty.")
+
+    success = settings_manager.update_dest_setting(new_target_dest)
+
+    if success:
+        try:
+            importlib.reload(dest)
+            global dests # Access the global dests dictionary
+            dests.clear() # Clear cached entities
+
+            # Update the global dest variable in main.py's scope
+            # This is if other parts of main directly reference `dest` after its initial import.
+            # However, the critical part is that `create_telegram_account` uses `dest.dest`.
+            # Rebinding the global `dest` name in `main.py`'s scope to the module is good practice.
+            # This was changed from `from dest import dest` to `import dest`
+            # So, direct access should now be `dest.dest`
+
+            await message.reply(f"✅ Destination updated to <code>{new_target_dest}</code> in <code>settings/dest.py</code>.\n"
+                                "The <code>dest</code> module has been reloaded and target entity cache cleared.\n"
+                                "🔁 Changes will apply to new account initializations. For active operations on already initialized accounts, a script restart might be safest.",
+                                parse_mode=types.ParseMode.HTML)
+        except Exception as e:
+            await message.reply(f"🔴 Destination setting saved to file, but an error occurred: {e}")
+    else:
+        await message.reply(f"🔴 Failed to update destination. Ensure <code>settings/dest.py</code> is writable.")
+
+@dp.message_handler(commands=['add_apikey'])
+async def add_apikey_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().split()
+    if len(args) != 2:
+        return await message.reply("ℹ️ Usage: `/add_apikey <api_id> <api_hash>`")
+
+    api_id, api_hash = args[0], args[1]
+
+    # Basic validation (can be more sophisticated)
+    if not api_id.isdigit():
+        return await message.reply("🔴 Invalid API ID: Must be a number.")
+    if not api_hash or len(api_hash) < 30: # Basic check for hash length/presence
+        return await message.reply("🔴 Invalid API Hash: Appears too short or empty.")
+
+    if settings_manager.add_api_key(api_id, api_hash):
+        await message.reply(f"✅ API Key <code>{api_id}:{'*' * len(api_hash)}</code> added successfully.\n"
+                            "🔁 Restart the script's main inviting process for the new key to be used in account cycling.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to add API Key. It might be a duplicate or an error occurred.", parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['remove_apikey'])
+async def remove_apikey_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().split()
+    if len(args) != 1:
+        return await message.reply("ℹ️ Usage: `/remove_apikey <api_id>`")
+
+    api_id_to_remove = args[0]
+    if not api_id_to_remove.isdigit():
+        return await message.reply("🔴 Invalid API ID: Must be a number.")
+
+    if settings_manager.remove_api_key(api_id_to_remove):
+        await message.reply(f"✅ API Key with ID <code>{api_id_to_remove}</code> removed successfully (if it existed).\n"
+                            "🔁 Restart the script's main inviting process to stop using this key.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to remove API Key with ID <code>{api_id_to_remove}</code> (it might not exist or an error occurred).",
+                            parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['list_apikeys'])
+async def list_apikeys_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    keys = settings_manager.get_api_keys_list(mask_hashes=True)
+    if not keys:
+        return await message.reply(f"ℹ️ No API keys found in `{settings_manager.API_KEYS_FILE}`.")
+
+    response_message = "🔑 **Configured API Keys:**\n"
+    for key_entry in keys:
+        response_message += f"- <code>{key_entry}</code>\n"
+
+    await message.reply(response_message, parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['add_user'])
+async def add_user_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().split()
+    if not args:
+        return await message.reply("ℹ️ Usage: `/add_user <username>` (e.g., `/add_user someuser`)")
+
+    username_to_add = args[0].lstrip('@')
+    if not username_to_add:
+        return await message.reply("🔴 Username cannot be empty.")
+
+    if settings_manager.add_username_to_file(username_to_add):
+        await message.reply(f"✅ Username <code>{username_to_add}</code> added to <code>{settings_manager.USERNAMES_FILE}</code>.\n"
+                            "🔁 Restart the main inviting process for this change to take effect in the current session.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to add username <code>{username_to_add}</code>. It might already exist or an error occurred.",
+                            parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['remove_user'])
+async def remove_user_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().split()
+    if not args:
+        return await message.reply("ℹ️ Usage: `/remove_user <username>`")
+
+    username_to_remove = args[0].lstrip('@')
+    if not username_to_remove:
+        return await message.reply("🔴 Username cannot be empty.")
+
+    if settings_manager.remove_username_from_file(username_to_remove):
+        await message.reply(f"✅ Username <code>{username_to_remove}</code> removed from <code>{settings_manager.USERNAMES_FILE}</code> (if it existed).\n"
+                            "🔁 Restart the main inviting process for this change to take effect.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to remove username <code>{username_to_remove}</code>. It might not exist or an error occurred.",
+                            parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['clear_users'])
+async def clear_users_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    if settings_manager.clear_usernames_file():
+        await message.reply(f"✅ All usernames cleared from <code>{settings_manager.USERNAMES_FILE}</code>.\n"
+                            "🔁 Restart the main inviting process for this change to take effect.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to clear usernames from <code>{settings_manager.USERNAMES_FILE}</code>.",
+                            parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['list_users'])
+async def list_users_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    usernames = settings_manager.get_usernames()
+    if not usernames:
+        return await message.reply(f"ℹ️ No usernames found in <code>{settings_manager.USERNAMES_FILE}</code>.",
+                                   parse_mode=types.ParseMode.HTML)
+
+    response_message = f"👥 **Usernames in <code>{settings_manager.USERNAMES_FILE}</code> ({len(usernames)} total):**\n"
+
+    # Display a limited number of usernames to avoid message length limits
+    display_limit = 20
+    for i, uname in enumerate(usernames):
+        if i < display_limit:
+            response_message += f"- <code>{uname}</code>\n"
+        else:
+            response_message += f"\n...and {len(usernames) - display_limit} more."
+            break
+
+    await message.reply(response_message, parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(content_types=types.ContentType.DOCUMENT)
+async def handle_document_upload(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        # Optionally, inform non-admins they can't do this, or just ignore.
+        return
+
+    # Handle usernames.txt upload
+    if message.document and (message.document.file_name.lower() == 'usernames.txt' or \
+                              (message.document.mime_type == 'text/plain' and 'user' in message.caption.lower() if message.caption else False)):
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            downloaded_file = await bot.download_file(file_info.file_path)
+            content = downloaded_file.read().decode('utf-8')
+            new_usernames = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith('#')]
+
+            if settings_manager.overwrite_usernames_file(new_usernames):
+                await message.reply(f"✅ Successfully processed uploaded usernames file <code>{message.document.file_name}</code>.\n"
+                                    f"<code>{len(new_usernames)}</code> usernames loaded into <code>{settings_manager.USERNAMES_FILE}</code>.\n"
+                                    "🔁 Restart the main inviting process for these changes to take effect.",
+                                    parse_mode=types.ParseMode.HTML)
+            else:
+                await message.reply(f"🔴 Failed to overwrite usernames from uploaded file.", parse_mode=types.ParseMode.HTML)
+        except Exception as e:
+            await message.reply(f"🔴 Error processing uploaded usernames file: {e}", parse_mode=types.ParseMode.HTML)
+            logging.error(f"Error processing uploaded usernames.txt: {e}")
+        return # Processed as usernames.txt
+
+    # Handle proxy.txt upload
+    if message.document and (message.document.file_name.lower() == 'proxy.txt' or \
+                              (message.document.mime_type == 'text/plain' and 'proxy' in message.caption.lower() if message.caption else False) ):
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            downloaded_file = await bot.download_file(file_info.file_path)
+            content = downloaded_file.read().decode('utf-8')
+            new_proxies = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith('#')]
+
+            if settings_manager.overwrite_proxies_file(new_proxies):
+                await message.reply(f"✅ Successfully processed uploaded proxy file <code>{message.document.file_name}</code>.\n"
+                                    f"<code>{len(new_proxies)}</code> proxies loaded into <code>{settings_manager.PROXY_FILE_SM}</code>.\n"
+                                    "🔁 Restart the main inviting process for these changes to take effect for new account initializations.",
+                                    parse_mode=types.ParseMode.HTML)
+            else:
+                await message.reply(f"🔴 Failed to overwrite proxies from uploaded file.", parse_mode=types.ParseMode.HTML)
+        except Exception as e:
+            await message.reply(f"🔴 Error processing uploaded proxy file: {e}", parse_mode=types.ParseMode.HTML)
+            logging.error(f"Error processing uploaded proxy.txt: {e}")
+        return # Processed as proxy.txt
+
+    elif message.document: # If it's another document type not caught above
+        await message.reply("ℹ️ Unrecognized document. If you're trying to update settings, please upload a correctly named `.txt` file (e.g., `usernames.txt`, `proxy.txt`) or use the specific commands.")
+
+
+@dp.message_handler(commands=['add_proxy'])
+async def add_proxy_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    proxy_string = message.get_args().strip()
+    if not proxy_string:
+        return await message.reply("ℹ️ Usage: `/add_proxy <proxy_string>` (e.g., `/add_proxy http:host:port:user:pass`)")
+
+    if settings_manager.add_proxy_to_file(proxy_string):
+        await message.reply(f"✅ Proxy <code>{settings_manager.mask_proxy_string(proxy_string)}</code> added to <code>{settings_manager.PROXY_FILE_SM}</code>.\n"
+                            "🔁 Restart the main inviting process for this change to be used.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to add proxy. It might already exist or an error occurred.",
+                            parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['remove_proxy'])
+async def remove_proxy_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    proxy_string = message.get_args().strip()
+    if not proxy_string:
+        return await message.reply("ℹ️ Usage: `/remove_proxy <exact_proxy_string_to_remove>`")
+
+    if settings_manager.remove_proxy_from_file(proxy_string):
+        await message.reply(f"✅ Proxy <code>{settings_manager.mask_proxy_string(proxy_string)}</code> removed from <code>{settings_manager.PROXY_FILE_SM}</code> (if it existed).\n"
+                            "🔁 Restart the main inviting process.",
+                            parse_mode=types.ParseMode.HTML)
+    else:
+        await message.reply(f"🔴 Failed to remove proxy. It might not exist or an error occurred.",
+                            parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['list_proxies'])
+async def list_proxies_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    proxies = settings_manager.get_proxies()
+    if not proxies:
+        return await message.reply(f"ℹ️ No proxies found in <code>{settings_manager.PROXY_FILE_SM}</code>.",
+                                   parse_mode=types.ParseMode.HTML)
+
+    response_message = f"🌐 **Configured Proxies ({len(proxies)} total):**\n"
+    display_limit = 15
+    for i, p_str in enumerate(proxies):
+        if i < display_limit:
+            response_message += f"- <code>{settings_manager.mask_proxy_string(p_str)}</code>\n"
+        else:
+            response_message += f"\n...and {len(proxies) - display_limit} more."
+            break
+
+    await message.reply(response_message, parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['get_id'])
+async def get_id_command(message: types.Message):
+    if str(message.from_user.id) != ADMIN_ID:
+        return await message.reply("❌ This command is only for the admin.")
+
+    args = message.get_args().strip()
+    if not args:
+        await message.reply("ℹ️ Please provide a Telegram link or username after the command.\n"
+                            "Example: `/get_id @username` or `/get_id t.me/joinchat/link` or `/get_id https://t.me/publicchannel`")
+        return
+
+    identifier = args
+
+    active_client = None
+    if not accounts: # Ensure accounts is populated
+        await message.reply("🔴 No client accounts loaded. Cannot perform ID lookup.")
+        return
+
+    for client_session in accounts.values():
+        try: # Check if client is connected and authorized
+            if client_session.is_connected() and await client_session.is_user_authorized():
+                active_client = client_session
+                break
+        except Exception: # Catch potential errors if a session is bad
+            continue
+
+    if not active_client: # Fallback if no connected and authorized client found
+        active_client = next(iter(accounts.values()), None)
+
+    if not active_client:
+        await message.reply("🔴 No active or available client sessions to perform ID lookup. Please ensure accounts are loaded and authorized.")
+        return
+
+    try:
+        client_username = "N/A"
+        if hasattr(active_client, 'get_me') and callable(active_client.get_me):
+            me_info = await active_client.get_me()
+            if me_info and hasattr(me_info, 'username'):
+                client_username = me_info.username
+
+        colored_print(f"ℹ️ Admin requested ID for: {identifier} using client {client_username}", YELLOW)
+
+        entity = await active_client.get_entity(identifier)
+
+        entity_type = "Unknown"
+        if isinstance(entity, User):
+            entity_type = "User"
+        elif isinstance(entity, Chat):
+            entity_type = "Chat"
+        elif isinstance(entity, Channel):
+            entity_type = "Channel"
+            if entity.megagroup: # Distinguish between broadcast channel and supergroup/megagroup
+                entity_type = "Megagroup (Channel)"
+
+        title = getattr(entity, 'title', None) or \
+                getattr(entity, 'username', None) or \
+                (f"{getattr(entity, 'first_name', '')} {getattr(entity, 'last_name', '')}".strip()) or \
+                "N/A"
+        if not title or title == "N/A": # If title is still N/A, try to construct from first/last name for users
+             if isinstance(entity, User) and (entity.first_name or entity.last_name):
+                 title = f"{entity.first_name or ''} {entity.last_name or ''}".strip()
+
+
+        response_text = (
+            f"✅ **Entity Found!**\n\n"
+            f"🆔 **ID:** `{entity.id}`\n"
+            f"👤 **Type:** `{entity_type}`\n"
+            f"📝 **Title/Name/Username:** `{title}`"
+        )
+        # Use HTML for consistency with other commands
+        await message.reply(response_text, parse_mode=types.ParseMode.HTML.replace("**", "b").replace("`", "code"))
+
+
+    except ValueError as e:
+        await message.reply(f"🔴 Could not resolve identifier: <code>{identifier}</code>.\n"
+                            f"Error: <code>{e}</code>\n"
+                            f"ℹ️ Ensure the link/username is correct and accessible by one of the bot's client accounts.", parse_mode=types.ParseMode.HTML)
+    except errors.rpcerrorlist.UsernameInvalidError as e:
+        await message.reply(f"🔴 Invalid username or not found: <code>{identifier}</code>.\nError: <code>{e}</code>", parse_mode=types.ParseMode.HTML)
+    except errors.RPCError as e:
+        await message.reply(f"🔴 Telegram API error while resolving <code>{identifier}</code>:\n<code>{e}</code>", parse_mode=types.ParseMode.HTML)
+    except Exception as e:
+        colored_print(f"🔴 Unexpected error in /get_id for {identifier}: {e}", RED)
+        await message.reply(f"🔴 An unexpected error occurred: <code>{e}</code>", parse_mode=types.ParseMode.HTML)
 
 
 async def main():
-    global last_account_switch_time, session_names, inviting_paused, db
+    global last_account_switch_time, session_names, inviting_paused, db, dests # Added dests to global
 
-    colored_print("🚀🚀🚀 Запуск скрипта! Начинаем работу! ✨✨✨", GREEN)
+    colored_print("🚀🚀🚀 Запуск скрипта!  Начинаем работу! ✨✨✨", GREEN)
     await send_log_to_telegram("🚀🚀🚀 <b>Запуск скрипта!</b> Начинаем работу! ✨✨✨")
 
     try:
         with open(API_KEYS_FILE, 'r') as f:
             api_keys = [line.strip().split(':') for line in f if line.strip()]
     except FileNotFoundError:
-        colored_print(f"  🔴 Файл {API_KEYS_FILE} не найден. Пожалуйста, создайте файл и добавьте API ключи в формате 'API_ID:API_HASH'.", RED)
-        await send_log_to_telegram(f"🔴 Файл <code>{API_KEYS_FILE}</code> не найден. Пожалуйста, создайте файл и добавьте API ключи в формате 'API_ID:API_HASH'.")
+        colored_print(f"  ⛔ Файл {API_KEYS_FILE} не найден 😢. Пожалуйста, добавьте файл с API ключами.", RED)
+        await send_log_to_telegram(f"❌ Файл <code>{API_KEYS_FILE}</code> не найден 😢. Пожалуйста, добавьте файл с API ключами.")
         sys.exit(1)
 
     if not api_keys:
-        colored_print(f"  🔴 Файл {API_KEYS_FILE} пустой. Необходимо добавить API ключи в формате 'API_ID:API_HASH'.", RED)
-        await send_log_to_telegram(f"🔴 Файл <code>{API_KEYS_FILE}</code> пустой. Необходимо добавить API ключи в формате 'API_ID:API_HASH'.")
+        colored_print(f"  ⛔ Файл {API_KEYS_FILE} пустой 🫥. Необходимо добавить API ключи.", RED)
+        await send_log_to_telegram(f"❌ Файл <code>{API_KEYS_FILE}</code> пустой 🫥. Необходимо добавить API ключи.")
         sys.exit(1)
 
     api_key_cycle = itertools.cycle(api_keys)
@@ -230,33 +739,32 @@ async def main():
                             else:
                                  raise ValueError(f"Неверный формат прокси в строке: {line}")
                         except ValueError as e:
-                            colored_print(f"  🟡 Предупреждение: Ошибка при чтении прокси: {e}. Строка: {line}. Пропускаем...", YELLOW)
-                            await send_log_to_telegram(f"🟡 Предупреждение: Ошибка при чтении прокси: {e}. Строка: <code>{line}</code>. Пропускаем...")
+                            colored_print(f"  ⚠ Ошибка при чтении прокси: {e}. Строка: {line}. Пропускаем...", YELLOW)
                             continue
 
 
         except FileNotFoundError:
-            colored_print(f"  🟡 Файл {PROXY_FILE} не найден. Работаем без прокси. 🌐", YELLOW)
-            await send_log_to_telegram(f"🟡 Файл <code>{PROXY_FILE}</code> не найден. Работаем без прокси. 🌐")
+            colored_print(f"  ⚠ Файл {PROXY_FILE} не найден. Работаем без прокси.", YELLOW)
+            await send_log_to_telegram("⚠ Файл с прокси не найден. Работаем без прокси.")
         except Exception as e:
-            colored_print(f"  🔴 Ошибка при чтении файла {PROXY_FILE}: {e}. Продолжаем работу без прокси. 🌐", RED)
-            await send_log_to_telegram(f"🔴 Ошибка при чтении файла <code>{PROXY_FILE}</code>: {e}. Продолжаем работу без прокси. 🌐")
+            colored_print(f"  ⛔ Ошибка при чтении файла {PROXY_FILE}: {e}. Продолжаем работу без прокси.", RED)
+            await send_log_to_telegram(f"❌ Ошибка при чтении файла с прокси: {e}. Продолжаем работу без прокси.")
     else:
-        colored_print(f"  🟡 Файл {PROXY_FILE} не найден. Работаем без прокси. 🌐", YELLOW)
-        await send_log_to_telegram(f"🟡 Файл <code>{PROXY_FILE}</code> не найден. Работаем без прокси. 🌐")
+        colored_print(f"  ⚠ Файл {PROXY_FILE} не найден. Работаем без прокси.", YELLOW)
+        await send_log_to_telegram("⚠ Файл с прокси не найден. Работаем без прокси.")
 
     proxy_cycle = itertools.cycle(proxies) if proxies else None
 
     session_names = [f for f in os.listdir(SESSION_DIR) if f.endswith('.session')]
     if not session_names:
-        colored_print(f"  🔴 Папка {SESSION_DIR} пустая. Пожалуйста, добавьте файлы сессий Telegram (.session).", RED)
-        await send_log_to_telegram(f"🔴 Папка <code>{SESSION_DIR}</code> пустая. Пожалуйста, добавьте файлы сессий Telegram (.session).")
+        colored_print(f"  ⛔ Папка {SESSION_DIR} пустая 🫥. Пожалуйста, добавьте файлы сессий Telegram.", RED)
+        await send_log_to_telegram(f"❌ Папка <code>{SESSION_DIR}</code> пустая 🫥. Пожалуйста, добавьте файлы сессий Telegram.")
         sys.exit(1)
 
     api_key_counts = {}
     valid_session_names = []
     for session_name in session_names:
-        colored_print(f'  🔄 Пробуем авторизовать аккаунт {session_name}...', GREEN)
+        colored_print(f'  ✅ Пробуем авторизовать аккаунт {session_name} 💫', GREEN)
         api_id, api_hash = next(api_key_cycle)
         proxy = next(proxy_cycle) if proxy_cycle else None
 
@@ -264,36 +772,38 @@ async def main():
 
         if account:
             try:
-                dests[session_name] = await account.get_entity(dest)
+                # Ensure dests is a dictionary
+                if not isinstance(dests, dict): # Should be initialized as {} globally
+                    dests = {}
+                dests[session_name] = await account.get_entity(dest.dest) # Use dest.dest
                 valid_session_names.append(session_name)
                 accounts[session_name] = account
-                colored_print(f'    ✅ Аккаунт {session_name} успешно авторизован и готов к работе! ✨', GREEN)
-                await send_log_to_telegram(f"✅ Аккаунт <b>{session_name}</b> успешно авторизован и готов к работе! ✨")
+                colored_print(f'    🟢 Аккаунт {session_name} успешно авторизован! ✨', GREEN)
+                await send_log_to_telegram(f"✅ Аккаунт <b>{session_name}</b> успешно авторизован! ✨")
 
                 if (api_id, api_hash) not in api_key_counts:
                     api_key_counts[(api_id, api_hash)] = 0
                 api_key_counts[(api_id, api_hash)] += 1
                 if api_key_counts[(api_id, api_hash)] > MAX_ACCOUNTS_PER_API:
-                    colored_print(f"  🔴 Превышено максимальное количество аккаунтов ({MAX_ACCOUNTS_PER_API}) на одном ключе API {api_id}:{api_hash}. Проверьте настройки.", RED)
-                    await send_log_to_telegram(f"🔴 Превышено максимальное количество аккаунтов ({MAX_ACCOUNTS_PER_API}) на API: <b>{api_id}:{api_hash}</b>. Проверьте настройки.")
+                    colored_print(f"  ⛔ Превышено максимальное количество аккаунтов ({MAX_ACCOUNTS_PER_API}) на одном ключе API {api_id}:{api_hash}. 🤯", RED)
+                    await send_log_to_telegram(f"❌ Превышено максимальное количество аккаунтов на API: <b>{api_id}:{api_hash}</b>. 🤯")
                     sys.exit(1)
             except Exception as e:
-                colored_print(f"  🔴 Не удалось получить информацию о целевой группе для аккаунта {session_name}: {e}. Пропускаем.", RED)
-                await send_log_to_telegram(f"🔴 Ошибка в сессии <b>{session_name}</b>: Не удалось получить информацию о целевой группе (<code>{dest}</code>). Проверьте, существует ли группа/канал и доступен ли он этому аккаунту.")
+                colored_print(f"  ⛔ Не удалось получить информацию о целевой группе для аккаунта {session_name}: {e}. Пропускаем.", RED)
+                await send_log_to_telegram(f"❌ Ошибка в сессии <b>{session_name}</b>: Не удалось получить информацию о целевой группе 😔.")
                 continue
         else:
-            # Сообщение об ошибке авторизации уже отправлено из create_telegram_account
             pass
 
 
     if not valid_session_names:
-        colored_print("  🔴 Нет активных аккаунтов для работы. Пожалуйста, проверьте сессии. Завершаем работу. 💔", RED)
-        await send_log_to_telegram("🔴 Нет активных аккаунтов для работы. Пожалуйста, проверьте сессии. Завершаем работу. 💔")
+        colored_print("  ⛔ Нет активных аккаунтов 😭. Завершаем работу.", RED)
+        await send_log_to_telegram("❌ Нет активных аккаунтов 😭. Завершаем работу.")
         sys.exit(1)
 
     session_names = valid_session_names
-    colored_print('🏁 Все доступные аккаунты авторизованы. Скрипт запущен и готов к работе! 💪🎉', GREEN)
-    await send_log_to_telegram("🏁 Все доступные аккаунты авторизованы. Скрипт запущен и готов к работе! 💪🎉")
+    colored_print('🏁 Скрипт запущен и готов к работе! 💪🎉', GREEN)
+    await send_log_to_telegram("🏁 Скрипт запущен и готов к работе! 💪🎉")
 
     db = pickledb.load(DB_FILE, True)
 
@@ -302,126 +812,86 @@ async def main():
     previous_usernames_hash = db.get('usernames_hash')
 
     if current_usernames_hash != previous_usernames_hash:
-        colored_print("  ℹ️ Файл со списком пользователей изменился. Начинаем обработку с начала списка. 📄", GREEN)
-        await send_log_to_telegram("ℹ️ Файл со списком пользователей (<code>usernames.txt</code>) изменился. Начинаем обработку с начала списка. 📄")
+        colored_print("  🔄 Файл со списком пользователей изменился 🔄. Начинаем с начала 😉.", GREEN)
+        await send_log_to_telegram("🔄 Файл со списком пользователей изменился. Начинаем с начала 😉.")
         db.set('start', 0)
         db.set('usernames_hash', current_usernames_hash)
         ind = 0
     else:
         ind = int(db.get('start')) if db.get('start') is not None else 0
-        # Ensure usernames_list is loaded before trying to access it
-        try:
-            with open(USERNAMES_FILE, 'r') as f:
-                usernames_list = [line.strip() for line in f]
-            start_username = usernames_list[ind] if ind < len(usernames_list) else "конец списка"
-            colored_print(f'  ▶️ Продолжаем работу с пользователя {start_username} (номер {ind} в списке).', GREEN)
-            await send_log_to_telegram(f"▶️ Продолжаем работу с пользователя <b>{start_username}</b> (номер <b>{ind}</b> в списке).")
-        except FileNotFoundError:
-            colored_print(f"  🔴 Файл {USERNAMES_FILE} не найден, хотя хэш совпадает. Это странно. Начинаем с начала.", RED)
-            await send_log_to_telegram(f"🔴 Файл <code>{USERNAMES_FILE}</code> не найден, хотя хэш совпадает. Начинаем с начала.")
-            ind = 0 # Reset index as file is missing
-            usernames_list = [] # Ensure usernames_list is empty
-            db.set('start', 0) # Reset start for next run if file appears
-            db.set('usernames_hash', None) # Reset hash
+        with open(USERNAMES_FILE, 'r') as f:
+            usernames_list = [line.strip() for line in f]
+        start_username = usernames_list[ind] if ind < len(usernames_list) else "неизвестен 🤷"
 
+        colored_print(f'  🔄 Продолжаем с пользователя {start_username} (номер {ind}) 🔄', GREEN)
+        await send_log_to_telegram(f"🔄 Продолжаем с пользователя <b>{start_username}</b> (номер <b>{ind}</b>) 🔄")
 
     joined_group = {session_name: False for session_name in session_names}
 
     try:
-        # usernames_list might be already loaded if continuing, otherwise load it here
-        if 'usernames_list' not in locals() or not usernames_list:
-            with open(USERNAMES_FILE, 'r') as f:
-                usernames = [line.strip() for line in f]
-        else:
-            usernames = usernames_list
+        with open(USERNAMES_FILE, 'r') as f:
+            usernames = [line.strip() for line in f]
     except FileNotFoundError:
-        colored_print(f"  🔴 Файл {USERNAMES_FILE} не найден. Пожалуйста, создайте файл и добавьте имена пользователей.", RED)
-        await send_log_to_telegram(f"🔴 Файл <code>{USERNAMES_FILE}</code> не найден. Пожалуйста, создайте файл и добавьте имена пользователей.")
+        colored_print(f"  ⛔ Файл {USERNAMES_FILE} не найден 😢.", RED)
+        await send_log_to_telegram(f"❌ Файл <code>{USERNAMES_FILE}</code> не найден 😢.")
         usernames = []
 
-    if not usernames: # Handles both file not found and empty file after attempting to load
-        colored_print(f"  🟡 Файл {USERNAMES_FILE} пуст или не найден. Пожалуйста, укажите источник пользователей.", YELLOW)
-        await send_log_to_telegram(f"🟡 Файл <code>{USERNAMES_FILE}</code> пуст или не найден. Пожалуйста, укажите источник пользователей.")
+    if not usernames:
         while True:
-            source_chat_url = input(f"  📝 Введите ссылку на публичный чат для парсинга пользователей (или 'exit' для выхода): ")
-            if source_chat_url.lower() == 'exit':
-                colored_print("🚪 Выход из скрипта по команде пользователя.", YELLOW)
-                await send_log_to_telegram("🚪 Выход из скрипта по команде пользователя.")
-                sys.exit(0)
+            source_chat_url = input(f"  📝 Файл {USERNAMES_FILE} пустой 🫥. Введите ссылку на чат, откуда брать пользователей: ")
             try:
-                if not valid_session_names: # Should not happen due to earlier check, but good for safety
-                    colored_print("  🔴 Нет активных аккаунтов для парсинга. Завершаем работу. 💔", RED)
-                    await send_log_to_telegram("🔴 Нет активных аккаунтов для парсинга. Завершаем работу. 💔")
+                if valid_session_names:
+                    account = accounts[valid_session_names[0]]
+                    source_chat = await account.get_entity(source_chat_url)
+                    break
+                else:
+                    colored_print("  ⛔ Нет активных аккаунтов для получения информации о чате 😭. Завершаем работу.", RED)
+                    await send_log_to_telegram("❌ Нет активных аккаунтов для получения информации о чате 😭. Завершаем работу.")
                     sys.exit(1)
-
-                account = accounts[valid_session_names[0]] # Use the first valid account for parsing
-                colored_print(f"  ⏳ Пытаемся получить доступ к чату: {source_chat_url}...", YELLOW)
-                await send_log_to_telegram(f"⏳ Пытаемся получить доступ к чату: <code>{source_chat_url}</code>...")
-                source_chat = await account.get_entity(source_chat_url)
-                colored_print(f"  ✅ Доступ к чату {source_chat_url} получен. Начинаем сбор участников...", GREEN)
-                await send_log_to_telegram(f"✅ Доступ к чату <code>{source_chat_url}</code> получен. Начинаем сбор участников...")
-                break
             except ValueError:
-                colored_print(f"  🔴 Некорректная ссылка: {source_chat_url}. Попробуйте ещё раз или введите 'exit'.", RED)
-                await send_log_to_telegram(f"🔴 Некорректная ссылка: <code>{source_chat_url}</code>. Попробуйте ещё раз или введите 'exit'.")
+                colored_print("  ⚠ Некорректная ссылка 🤕. Попробуйте ещё раз.", RED)
+                await send_log_to_telegram(f"⚠ Некорректная ссылка 🤕: <code>{source_chat_url}</code>")
             except Exception as e:
-                colored_print(f"  🔴 Не удалось получить информацию о чате {source_chat_url}: {e}. Попробуйте другую ссылку или 'exit'.", RED)
-                await send_log_to_telegram(f"🔴 Не удалось получить информацию о чате <code>{source_chat_url}</code>: {e}. Попробуйте другую ссылку или 'exit'.")
-                # Do not break here, let the user try again or exit
+                colored_print(f"  ⛔ Не удалось получить информацию о чате: {e}", RED)
+                await send_log_to_telegram(f"❌ Не удалось получить информацию о чате: <code>{source_chat_url}</code>: {e}")
+                break
 
         try:
             participants = await account(GetParticipantsRequest(
                 source_chat,
-                ChannelParticipantsSearch(''), # Get all participants
-                0, 10000, # You might want to handle pagination for very large chats
+                ChannelParticipantsSearch(''),
+                0, 1000,
                 hash=0
             ))
             usernames = [user.username for user in participants.users if user.username]
-            if usernames:
-                with open(USERNAMES_FILE, 'w') as f:
-                    for username in usernames:
-                        f.write(f"{username}\n")
-                colored_print(f"  👥 Успешно собрано {len(usernames)} пользователей из чата {source_chat_url} и сохранено в {USERNAMES_FILE}.", GREEN)
-                await send_log_to_telegram(f"👥 Успешно собрано {len(usernames)} пользователей из чата <code>{source_chat_url}</code> и сохранено в <code>{USERNAMES_FILE}</code>. Начинаем инвайтинг! 🚀")
-                # Update hash after fetching and saving new usernames
-                current_usernames_hash = get_file_hash(USERNAMES_FILE)
-                db.set('usernames_hash', current_usernames_hash)
-                db.set('start', 0) # Start from the beginning of the new list
-                ind = 0
-            else:
-                colored_print(f"  🟡 В чате {source_chat_url} не найдено пользователей с username. Пожалуйста, проверьте чат или укажите другой.", YELLOW)
-                await send_log_to_telegram(f"🟡 В чате <code>{source_chat_url}</code> не найдено пользователей с username. Пожалуйста, проверьте чат или укажите другой.")
-                sys.exit(1)
+            await send_log_to_telegram(f"✅ Получили список пользователей из чата <code>{source_chat_url}</code> ({len(usernames)} человек) 🎉.  Начинаем работу! 🤝")
 
         except Exception as e:
-            colored_print(f"  🔴 Не удалось получить список участников чата {source_chat_url}: {e}", RED)
-            await send_log_to_telegram(f"🔴 Не удалось получить список участников чата <code>{source_chat_url}</code>: {e}")
+            colored_print(f"  ⛔ Не удалось получить список участников чата: {e}", RED)
+            await send_log_to_telegram(f"❌ Не удалось получить список участников чата: {e}")
             sys.exit(1)
 
 
     while True:
         if bot_db.get('inviting_paused'):
-            colored_print("  ⏸️ Приглашения приостановлены администратором. Ожидаем возобновления...", YELLOW)
-            # Send periodic log message about paused state if needed, but avoid spamming
-            await asyncio.sleep(15) # Check every 15 seconds
+            await asyncio.sleep(5)
             continue
 
         if ind >= len(usernames):
-            colored_print('  🏁🎉🎉 Все пользователи из списка обработаны! Завершение работы. 🎉🎉🎉', GREEN)
-            await send_log_to_telegram("🏁🎉🎉 Все пользователи из списка обработаны! Завершение работы. 🎉🎉🎉")
-            db.set('start', 0) # Reset for next run with potentially new users
+            colored_print('  🎉🎉🎉 Все пользователи обработаны! Успешное завершение! 🎉🎉🎉', GREEN)
+            await send_log_to_telegram("🎉🎉🎉 Все пользователи обработаны! Успешное завершение! 🎉🎉🎉")
             break
 
         username = usernames[ind]
 
         current_time = time.time()
-        if current_time - last_account_switch_time < delay_between_clients:
-            remaining_delay = delay_between_clients - (current_time - last_account_switch_time)
-            colored_print(f"  ⏳ Ожидаем {remaining_delay:.2f} сек. перед сменой аккаунта (общая задержка между клиентами)...", YELLOW)
+        if current_time - last_account_switch_time < delay.delay_between_clients:
+            remaining_delay = delay.delay_between_clients - (current_time - last_account_switch_time)
+            colored_print(f"  ⏳ Ждём {remaining_delay:.2f} секунд перед сменой аккаунта ⏱", YELLOW)
             await asyncio.sleep(remaining_delay)
 
-        rd_session_name = random.choice(session_names) # Select a random available session
-        colored_print(f'  ➡️  Выбран аккаунт: {rd_session_name} для @{username}', GREEN)
+        rd_session_name = random.choice(session_names)
+        colored_print(f'  🔄 Переключаемся на аккаунт {rd_session_name} ⚙️', GREEN)
         last_account_switch_time = time.time()
 
         account = accounts[rd_session_name]
@@ -430,89 +900,79 @@ async def main():
         if rd_session_name in accounts_on_cooldown:
             remaining_cooldown = accounts_on_cooldown[rd_session_name] - time.time()
             if remaining_cooldown > 0:
-                colored_print(f'  ⏳ Аккаунт {rd_session_name} на перерыве ещё {remaining_cooldown:.2f} сек. 😴 Пропускаем...', YELLOW)
-                await asyncio.sleep(delay_between_accounts) # Wait before trying another account or same account again
+                colored_print(f'  ⏰ Аккаунт {rd_session_name} на перерыве ещё {remaining_cooldown:.2f} секунд 🛌. Пропускаем...', RED)
+                await asyncio.sleep(delay.delay_between_accounts)
 
                 all_on_cooldown = True
-                active_sessions_available = False
                 for s_name in session_names:
                     if s_name not in accounts_on_cooldown or accounts_on_cooldown[s_name] <= time.time():
-                        active_sessions_available = True
+                        all_on_cooldown = False
                         break
-                if not active_sessions_available: # Corrected logic
-                    colored_print("  🔴 Все аккаунты на временном перерыве (cooldown). Ожидаем истечения перерыва или завершаем, если это надолго.", RED)
-                    await send_log_to_telegram("🔴 Все аккаунты на временном перерыве (cooldown). Скрипт приостановит работу до истечения самого короткого перерыва.")
-                    # Optional: Find the minimum cooldown and sleep for that duration, then continue
-                    # For now, let it cycle and wait with delay_between_accounts
-                    # sys.exit(1) # Or implement a smarter wait
-                continue # Try next available account or wait
+                if all_on_cooldown:
+                    colored_print("  ⚠ Все аккаунты на перерыве 😴. Завершаем работу.", RED)
+                    await send_log_to_telegram("⚠ Все аккаунты на перерыве 😴. Завершаем работу.")
+                    sys.exit(1)
+
+                continue
             else:
-                del accounts_on_cooldown[rd_session_name] # Cooldown expired
+                del accounts_on_cooldown[rd_session_name]
 
         try:
             user = await account.get_input_entity(username)
 
             if not joined_group[rd_session_name]:
                 try:
-                    colored_print(f"    ➕ Аккаунт {rd_session_name} вступает в целевую группу: {dest}...", YELLOW)
-                    await send_log_to_telegram(f"➕ Аккаунт <b>{rd_session_name}</b> вступает в целевую группу: <code>{dest}</code>...")
                     await account(JoinChannelRequest(dest_entity))
-                    colored_print(f"    ✅ Аккаунт {rd_session_name} успешно вступил в целевую группу!", GREEN)
-                    await send_log_to_telegram(f"✅ Аккаунт <b>{rd_session_name}</b> успешно вступил в целевую группу!")
+                    colored_print(f"    ➕ Аккаунт {rd_session_name} вступил в целевую группу ✅", GREEN)
+                    await send_log_to_telegram(f"➕ Аккаунт <b>{rd_session_name}</b> вступил в целевую группу ✅")
                     joined_group[rd_session_name] = True
-                    colored_print(f"    ⏳ Пауза {delay_after_join} сек. после вступления в группу...", YELLOW)
-                    await asyncio.sleep(delay_after_join)
-                except errors.rpcerrorlist.ImportBotAuthorizationRequiredError: # Specific error for bots
-                    colored_print(f"    ℹ️ Аккаунт {rd_session_name} является ботом 🤖 и не может вступать в группы. Приглашения будут осуществляться без вступления.", YELLOW)
-                    await send_log_to_telegram(f"ℹ️ Аккаунт <b>{rd_session_name}</b> является ботом 🤖 и не может вступать в группы. Приглашения будут осуществляться без вступления.")
-                    joined_group[rd_session_name] = True # Mark as "joined" to skip this step next time
-                    # No delay_after_error needed here as it's not a real error for this operation
-                except UserChannelsTooMuchError:
-                    colored_print(f"    🔴 Аккаунт {rd_session_name} уже состоит в слишком большом количестве каналов/групп и не может вступить в целевую. Пропускаем аккаунт.", RED)
-                    await send_log_to_telegram(f"🔴 Аккаунт <b>{rd_session_name}</b> уже состоит в слишком большом количестве каналов/групп и не может вступить в целевую. Пропускаем аккаунт.")
-                    session_names.remove(rd_session_name) # Remove from active list for this run
-                    if not session_names:
-                        colored_print("  🔴 Все доступные аккаунты не смогли вступить в группу (слишком много каналов). Завершение работы.", RED)
-                        await send_log_to_telegram("🔴 Все доступные аккаунты не смогли вступить в группу (слишком много каналов). Завершение работы.")
-                        sys.exit(1)
-                    continue # Try with next account
+                    await asyncio.sleep(delay.delay_after_join)
+                except errors.rpcerrorlist.ImportBotAuthorizationRequiredError:
+                    colored_print(f"    ⛔ Аккаунт {rd_session_name} - бот 🤖. Боты не могут вступать в группы.", RED)
+                    await send_log_to_telegram(f"⚠ Аккаунт <b>{rd_session_name}</b> - бот 🤖.")
+                    joined_group[rd_session_name] = True
+                    await asyncio.sleep(delay.delay_after_error)
+                    continue
                 except Exception as e:
-                    colored_print(f"    🔴 Ошибка при вступлении аккаунта {rd_session_name} в целевую группу: {e}. Пауза {delay_after_error} сек.", RED)
-                    await send_log_to_telegram(f"🔴 Ошибка при вступлении аккаунта <b>{rd_session_name}</b> в целевую группу (<code>{dest}</code>): {e}. Пауза {delay_after_error} сек.")
-                    await asyncio.sleep(delay_after_error)
-                    continue # Try with next user or account after delay
+                    colored_print(f"    ⛔ Ошибка при вступлении аккаунта {rd_session_name} в целевую группу: {e}", RED)
+                    await send_log_to_telegram(f"⚠ Ошибка при вступлении аккаунта <b>{rd_session_name}</b> в целевую группу: {e}")
+                    await asyncio.sleep(delay.delay_after_error)
+                    continue
 
             if isinstance(user, InputPeerUser):
-                colored_print(f"    📧 {ind + 1}/{len(usernames)}: Приглашаем @{username} в группу с аккаунта {rd_session_name}...", GREEN)
                 await account(InviteToChannelRequest(dest_entity, [user]))
-                # Verification of addition is tricky and often unreliable immediately.
-                # Telegram might delay actual addition or not provide instant feedback.
-                # The log below is optimistic. For critical tasks, verify separately or later.
-                colored_print(f"    ✅ {ind + 1}/{len(usernames)}: Приглашение для @{username} отправлено с аккаунта {rd_session_name}. (Проверка фактического добавления не производится).", GREEN)
-                await send_log_to_telegram(f"✅ [{ind+1}/{len(usernames)}] Приглашение для <b>@{username}</b> отправлено. (Аккаунт: <b>{rd_session_name}</b>)")
-                with open(USED_FILE, 'a') as used_file:
-                    used_file.write(f"{username}\n") # Log attempt
+                colored_print(f"    ✉ {ind + 1}: Пользователю @{username} отправлено приглашение 📨", GREEN)
+
+                participants = await account(GetParticipantsRequest(
+                    dest_entity,
+                    ChannelParticipantsSearch(username),
+                    0, 1,
+                    hash=0
+                ))
+                if participants.users:
+                    colored_print(f"    ✅ {ind + 1}: Пользователь @{username} успешно добавлен! 🎉", GREEN)
+                    await send_log_to_telegram(f"✅ [{ind+1}/{len(usernames)}] Пользователь <b>@{username}</b> успешно добавлен! 🎉 (аккаунт <b>{rd_session_name}</b>)")
+                    with open(USED_FILE, 'a') as used_file:
+                        used_file.write(f"{username}\n")
+                else:
+                    colored_print(f"    ⚠ {ind + 1}: Не удалось добавить пользователя @{username} 😔", RED)
             else:
-                colored_print(f"    ℹ️ {ind + 1}/{len(usernames)}: Нельзя пригласить @{username}, так как это не пользователь (возможно, канал, удаленный аккаунт или бот). Пропускаем.", YELLOW)
-                await send_log_to_telegram(f"ℹ️ [{ind+1}/{len(usernames)}] Нельзя пригласить @{username}, так как это не пользователь (возможно, канал, удаленный аккаунт или бот). Пропускаем.")
-                # No need for delay_after_error here, it's not an error, just a skip
-                # However, if this happens often, it might indicate a bad username list
+                colored_print(f"    ⚠ {ind + 1}: Нельзя пригласить @{username}, это не пользователь 🤷 (возможно, канал, чат или бот).", RED)
+                await send_log_to_telegram(f"⚠ Нельзя пригласить @{username}, это не пользователь 🤷.")
+                await asyncio.sleep(delay.delay_after_error) # Using delay.
+                continue
 
         except ValueError: # User not found
             colored_print(f'      🟡 {ind + 1}/{len(usernames)}: Пользователь @{username} не найден аккаунтом {rd_session_name}. Пропускаем. 🤷', YELLOW)
             await send_log_to_telegram(f"🟡 [{ind+1}/{len(usernames)}] Пользователь <b>@{username}</b> не найден аккаунтом {rd_session_name}. Пропускаем. 🤷")
-            # No specific delay needed for not found, but general delay_after_error might be too long.
-            # Consider a shorter, specific delay or rely on delay_between_clients.
             await asyncio.sleep(random.uniform(1,3)) # Short random delay
         except FloodWaitError as e:
             flood_seconds = e.seconds
             colored_print(f'      🌊 FloodWaitError для аккаунта {rd_session_name}: необходимо подождать {flood_seconds} секунд. Аккаунт будет на перерыве. ⏳', RED)
             await send_log_to_telegram(f"🌊 FloodWaitError для аккаунта <b>{rd_session_name}</b>: необходимо подождать {flood_seconds} секунд. Аккаунт будет на перерыве. ⏳")
             accounts_on_cooldown[rd_session_name] = time.time() + flood_seconds
-            # No need to sleep here, the main loop will handle cooldown and switch accounts.
-            # If this was the only account, the script would pause effectively.
-            ind -=1 # Retry current user with a different account after this account's cooldown
-        except UserChannelsTooMuchError: # This error was already handled during JoinChannelRequest, but can happen here too if not joined
+            ind -=1
+        except UserChannelsTooMuchError:
             colored_print(f"    🔴 Аккаунт {rd_session_name} уже состоит в слишком большом количестве каналов/групп. 🤯 Пропускаем аккаунт.", RED)
             await send_log_to_telegram(f"🔴 Аккаунт <b>{rd_session_name}</b> уже состоит в слишком большом количестве каналов/групп. 🤯 Пропускаем аккаунт.")
             if rd_session_name in session_names: session_names.remove(rd_session_name)
@@ -520,15 +980,14 @@ async def main():
                 colored_print("  🔴 Все доступные аккаунты были удалены (слишком много каналов). Завершение работы. 💔", RED)
                 await send_log_to_telegram("🔴 Все доступные аккаунты были удалены (слишком много каналов). Завершение работы. 💔")
                 sys.exit(1)
-            ind -=1 # Retry current user with a different account
+            ind -=1
         except errors.UserPrivacyRestrictedError:
             colored_print(f"    🛡️ {ind + 1}/{len(usernames)}: Пользователь @{username} имеет настройки приватности, не позволяющие его пригласить с аккаунта {rd_session_name}. Пропускаем. 😔", YELLOW)
             await send_log_to_telegram(f"🛡️ [{ind+1}/{len(usernames)}] Пользователь <b>@{username}</b> имеет настройки приватности (аккаунт <b>{rd_session_name}</b>). Пропускаем. 😔")
-            # Log to used.txt to avoid retrying this user again and again if privacy settings are permanent
             with open(USED_FILE, 'a') as used_file:
                 used_file.write(f"{username} #PrivacyRestricted\n")
-            await asyncio.sleep(delay_after_invite) # Standard delay after an attempt
-        except errors.ChatAdminRequiredError: # Should ideally not happen if bot is admin or invites are open
+            await asyncio.sleep(delay.delay_after_invite)
+        except errors.ChatAdminRequiredError:
             colored_print(f"    👮 Аккаунт {rd_session_name} не имеет прав администратора в целевой группе для приглашения (или приглашения закрыты). Проверьте права. Пропускаем аккаунт. 😔", RED)
             await send_log_to_telegram(f"👮 Аккаунт <b>{rd_session_name}</b> не имеет прав администратора в целевой группе <code>{dest}</code> (или приглашения закрыты). Проверьте права. Пропускаем аккаунт. 😔")
             if rd_session_name in session_names: session_names.remove(rd_session_name)
@@ -536,12 +995,12 @@ async def main():
                 colored_print("  🔴 Все доступные аккаунты не имеют прав администратора. Завершение работы. 💔", RED)
                 await send_log_to_telegram("🔴 Все доступные аккаунты не имеют прав администратора. Завершение работы. 💔")
                 sys.exit(1)
-            ind -=1 # Retry current user with a different account
-        except errors.UserNotMutualContactError: # Rare for group invites, more common for adding friends
+            ind -=1
+        except errors.UserNotMutualContactError:
             colored_print(f"    🤝 {ind + 1}/{len(usernames)}: Пользователь @{username} не является взаимным контактом для аккаунта {rd_session_name} и не может быть приглашен (нетипично для групп). Пропускаем. 😔", YELLOW)
             await send_log_to_telegram(f"🤝 [{ind+1}/{len(usernames)}] Пользователь <b>@{username}</b> не является взаимным контактом для <b>{rd_session_name}</b> (нетипично для групп). Пропускаем. 😔")
-            await asyncio.sleep(delay_after_invite)
-        except errors.rpcerrorlist.BotGroupsBlockedError: # If the inviting account is a bot and is blocked
+            await asyncio.sleep(delay.delay_after_invite)
+        except errors.rpcerrorlist.BotGroupsBlockedError:
             colored_print(f"    🚫 Бот {rd_session_name} заблокирован в группе {dest} или не может писать сообщения. Пропускаем аккаунт.", RED)
             await send_log_to_telegram(f"🚫 Бот <b>{rd_session_name}</b> заблокирован в группе <code>{dest}</code> или не может писать сообщения. Пропускаем аккаунт.")
             if rd_session_name in session_names: session_names.remove(rd_session_name)
@@ -549,14 +1008,14 @@ async def main():
                 colored_print("  🔴 Все доступные аккаунты-боты заблокированы. Завершение работы. 💔", RED)
                 await send_log_to_telegram("🔴 Все доступные аккаунты-боты заблокированы. Завершение работы. 💔")
                 sys.exit(1)
-            ind -=1 # Retry current user
-        except errors.rpcerrorlist.UserKickedError: # User was kicked and cannot be re-invited
+            ind -=1
+        except errors.rpcerrorlist.UserKickedError:
             colored_print(f"    🚫 {ind + 1}/{len(usernames)}: Пользователь @{username} был ранее удален из группы и не может быть приглашен снова. Пропускаем. 😔", YELLOW)
             await send_log_to_telegram(f"🚫 [{ind+1}/{len(usernames)}] Пользователь <b>@{username}</b> был ранее удален из группы и не может быть приглашен снова. Пропускаем. 😔")
             with open(USED_FILE, 'a') as used_file:
                 used_file.write(f"{username} #Kicked\n")
-            await asyncio.sleep(delay_after_invite)
-        except errors.rpcerrorlist.ChatWriteForbiddenError: # General write permission issue
+            await asyncio.sleep(delay.delay_after_invite)
+        except errors.rpcerrorlist.ChatWriteForbiddenError:
             colored_print(f"    ✍️ Аккаунт {rd_session_name} не имеет права писать/приглашать в целевую группу {dest} (возможно, группа только для чтения или аккаунт ограничен). Пропускаем аккаунт.", RED)
             await send_log_to_telegram(f"✍️ Аккаунт <b>{rd_session_name}</b> не имеет права писать/приглашать в целевую группу <code>{dest}</code>. Пропускаем аккаунт.")
             if rd_session_name in session_names: session_names.remove(rd_session_name)
@@ -564,35 +1023,34 @@ async def main():
                 colored_print("  🔴 Все доступные аккаунты не могут писать/приглашать в целевую группу. Завершение работы. 💔", RED)
                 await send_log_to_telegram("🔴 Все доступные аккаунты не могут писать/приглашать в целевую группу. Завершение работы. 💔")
                 sys.exit(1)
-            ind -=1 # Retry current user
-        except errors.rpcerrorlist.UsersTooMuchError: # Account has hit its daily invite limit
+            ind -=1
+        except errors.rpcerrorlist.UsersTooMuchError:
             colored_print(f"    📈 Аккаунт {rd_session_name} достиг лимита приглашений на сегодня. Аккаунт будет на перерыве до завтра. ⏳ Пропускаем аккаунт.", RED)
             await send_log_to_telegram(f"📈 Аккаунт <b>{rd_session_name}</b> достиг лимита приглашений. Аккаунт будет на перерыве до завтра. ⏳ Пропускаем аккаунт.")
-            accounts_on_cooldown[rd_session_name] = time.time() + 86400 # Cooldown for 24 hours
-            if rd_session_name in session_names: session_names.remove(rd_session_name) # Effectively remove for this run or manage cooldowns centrally
-            if not session_names and not any(accounts_on_cooldown[s] < time.time() + 86000 for s in accounts_on_cooldown): # Check if any account will be available soon
+            accounts_on_cooldown[rd_session_name] = time.time() + 86400
+            if rd_session_name in session_names: session_names.remove(rd_session_name)
+            if not session_names and not any(accounts_on_cooldown[s] < time.time() + 86000 for s in accounts_on_cooldown):
                  colored_print("  🔴 Все доступные аккаунты достигли суточного лимита приглашений. Завершение работы. 💔", RED)
                  await send_log_to_telegram("🔴 Все доступные аккаунты достигли суточного лимита приглашений. Завершение работы. 💔")
                  sys.exit(1)
-            ind -=1 # Retry current user
+            ind -=1
         except Exception as e:
-            colored_print(f'      🔴 {ind + 1}/{len(usernames)}: Непредвиденная ошибка при работе с @{username} через аккаунт {rd_session_name}: {type(e).__name__}: {e} 😥. Пропускаем пользователя и ждём {delay_after_error} сек.', RED)
-            await send_log_to_telegram(f"🔴 Непредвиденная ошибка при работе с <b>@{username}</b> через <b>{rd_session_name}</b>: {type(e).__name__}: {e} 😥. Пропускаем, ждём {delay_after_error} сек.")
-            await asyncio.sleep(delay_after_error)
-            # Consider not skipping user but putting account on short cooldown for unexpected errors.
-            # For now, user is skipped.
+            colored_print(f'      🔴 {ind + 1}/{len(usernames)}: Непредвиденная ошибка при работе с @{username} через аккаунт {rd_session_name}: {type(e).__name__}: {e} 😥. Пропускаем пользователя и ждём {delay.delay_after_error} сек.', RED)
+            await send_log_to_telegram(f"🔴 Непредвиденная ошибка при работе с <b>@{username}</b> через <b>{rd_session_name}</b>: {type(e).__name__}: {e} 😥. Пропускаем, ждём {delay.delay_after_error} сек.")
+            await asyncio.sleep(delay.delay_after_error) # Using delay.
 
         ind += 1
         db.set('start', str(ind)) # Save progress
         db.dump() # Ensure data is written to disk
-        colored_print(f"    ⏳ Пауза {delay_after_invite:.2f} сек. после попытки приглашения...", YELLOW)
-        await asyncio.sleep(delay_after_invite)
+        colored_print(f"    ⏳ Пауза {delay.delay_after_invite:.2f} сек. после попытки приглашения...", YELLOW)
+        await asyncio.sleep(delay.delay_after_invite) # Using delay.
 
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     try:
         async def on_startup(_):
+            # Apply UI/logging enhancements from previous steps to this message too
             colored_print("🤖 Телеграм-бот для управления командами успешно запущен! Готов принимать команды от администратора. 📡", GREEN)
             await send_log_to_telegram("🤖 Телеграм-бот для управления командами успешно запущен! Готов принимать команды от администратора. 📡")
 
@@ -600,11 +1058,9 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         colored_print("\n🚪 Прерывание пользователем (Ctrl+C). Завершение работы...", YELLOW)
-        # Attempt to send a log message, but it might not always succeed during shutdown
         try:
-            # Create a new loop for this final message if the main one is closing
             asyncio.run(send_log_to_telegram("🚪 Прерывание пользователем (Ctrl+C). Завершение работы..."))
-        except RuntimeError: # Loop might be closed already
+        except RuntimeError:
             pass
     except Exception as глобальная_ошибка:
         colored_print(f"💥 Глобальная непредвиденная ошибка в скрипте: {глобальная_ошибка}", RED)
@@ -616,7 +1072,6 @@ if __name__ == "__main__":
         colored_print("🛑 Скрипт завершил свою работу.", YELLOW)
         try:
             asyncio.run(send_log_to_telegram("🛑 Скрипт завершил свою работу."))
-        except RuntimeError: # Loop might be closed already
+        except RuntimeError:
             pass
         if loop.is_running() and not loop.is_closed():
-            loop.close()
